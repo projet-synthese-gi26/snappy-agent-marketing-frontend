@@ -1,8 +1,10 @@
+// src/app/chat/[chatId]/page.tsx
 "use client";
 
-import { useState, useRef, useEffect } from 'react';
+import { useState, useRef, useEffect, useCallback, use } from 'react';
 import Link from 'next/link';
-import { Bot, Send, User, BrainCircuit, EyeOff, Briefcase, ChevronLeft } from 'lucide-react';
+import { Bot, Send, User, BrainCircuit, EyeOff, Briefcase, ChevronLeft, Settings2 } from 'lucide-react';
+import { chatService } from '@/services/api';
 
 interface Message {
     id: string | number;
@@ -11,43 +13,69 @@ interface Message {
     time: string;
 }
 
-export default function ChatPage({ params }: { params: { chatId: string } }) {
+export default function ChatPage({ params }: { params: Promise<{ chatId: string }> }) {
+    // 0. DÉBALLAGE DES PARAMS (Nouveauté Next.js 15)
+    const { chatId } = use(params);
+
+    // --- ÉTATS ---
     const [mode, setMode] = useState<'OFF' | 'LISTEN' | 'ON'>('OFF');
+    const [contextWindow, setContextWindow] = useState<number>(6); // Fenêtre de contexte modifiable
+    const [showSettings, setShowSettings] = useState(false);
+    
     const [inputText, setInputText] = useState('');
     const [messages, setMessages] = useState<Message[]>([]);
     const [role, setRole] = useState<'user' | 'agent'>('user');
     const [isLoading, setIsLoading] = useState(false);
     
-    // Références pour gérer l'état de la machine (évite de trigger l'IA 2 fois sur le même message)
+    // Identifiant de session dynamique
+    const [sessionId, setSessionId] = useState<string | null>(null);
+
+    // Suivi machine à état
+    const processedCount = useRef<number>(0);
     const lastListenedMsgId = useRef<string | number | null>(null);
     const lastRespondedMsgId = useRef<string | number | null>(null);
 
-    const sessionId = `session_${params.chatId}`;
     const messagesEndRef = useRef<HTMLDivElement>(null);
-    
     const scrollToBottom = () => messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
     useEffect(() => { scrollToBottom(); }, [messages]);
 
-    // 1. Détection du Rôle
+    // --- INITIALISATION ---
     useEffect(() => {
+        // Rôle
         const savedRole = localStorage.getItem('chat_role') as 'user' | 'agent';
         if (savedRole) setRole(savedRole);
-    }, []);
 
-    // 2. POLLING BDD (Synchronisation)
+        // Session ID dynamique
+        const storageKey = `snappy_session_${chatId}`;
+        const savedSession = localStorage.getItem(storageKey);
+        if (savedSession) setSessionId(savedSession);
+    }, [chatId]);
+
+    // --- MISE A JOUR DU SESSION ID ---
+    const updateSessionId = useCallback((newId: string) => {
+        setSessionId(newId);
+        localStorage.setItem(`snappy_session_${chatId}`, newId);
+    }, [chatId]);
+
+    // --- POLLING ---
     useEffect(() => {
+        if (!sessionId) return; // Ne pas poll si la conversation n'a pas commencé
+
         const fetchHistory = async () => {
             try {
-                const res = await fetch(`${process.env.NEXT_PUBLIC_API_URL}/chat/${sessionId}/history`);
-                if (res.ok) {
-                    const history = await res.json();
-                    const mapped = history.map((m: any, i: number) => ({
-                        id: `hist-${i}`,
-                        text: m.content,
-                        sender: m.role,
-                        time: new Date().toLocaleTimeString([], {hour: '2-digit', minute:'2-digit'})
-                    }));
-                    setMessages(mapped);
+                const history = await chatService.getHistory(sessionId);
+                const mapped = history.map((m: any, i: number) => ({
+                    id: `hist-${i}`,
+                    text: m.content,
+                    sender: m.role,
+                    time: new Date().toLocaleTimeString([], {hour: '2-digit', minute:'2-digit'})
+                }));
+                
+                setMessages(mapped);
+                
+                // Si c'est le premier chargement complet
+                if (processedCount.current === 0 && mapped.length > 0) {
+                    processedCount.current = mapped.length;
                 }
             } catch (err) {
                 console.error("Erreur sync", err);
@@ -59,76 +87,63 @@ export default function ChatPage({ params }: { params: { chatId: string } }) {
         return () => clearInterval(interval);
     }, [sessionId]);
 
-    // 3. LOGIQUE POMDP INTELLIGENTE (Gérée par le frontend du Vendeur)
+    // --- LOGIQUE POMDP ---
     useEffect(() => {
-        if (role !== 'agent' || messages.length === 0) return;
+        if (role !== 'agent' || messages.length <= processedCount.current) return;
 
-        // On regarde UNIQUEMENT le dernier message
-        const lastMsg = messages[messages.length - 1];
+        const newMessages = messages.slice(processedCount.current);
+        processedCount.current = messages.length;
 
-        // L'IA ne réagit que si le dernier à avoir parlé est le client ('user')
-        if (lastMsg.sender === 'user') {
-            
-            if (mode === 'LISTEN') {
-                // Si on n'a pas encore écouté CE message précis
-                if (lastListenedMsgId.current !== lastMsg.id) {
-                    lastListenedMsgId.current = lastMsg.id;
-                    console.log("👂 [POMDP] Entraînement sur le message...");
-                    fetch(`${process.env.NEXT_PUBLIC_API_URL}/agent/listen`, {
-                        method: 'POST',
-                        headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify({ session_id: sessionId, message: lastMsg.text })
-                    });
-                }
+        const lastUserMsg = [...newMessages].reverse().find(m => m.sender === 'user');
+
+        if (lastUserMsg) {
+            if (mode === 'LISTEN' && lastListenedMsgId.current !== lastUserMsg.id) {
+                lastListenedMsgId.current = lastUserMsg.id;
+                console.log("👂 [POMDP] Entraînement en tâche de fond...");
+                chatService.agentListen(lastUserMsg.text, sessionId).then(res => {
+                    if (res.session_id && !sessionId) updateSessionId(res.session_id);
+                }).catch(console.error);
             } 
-            
-            else if (mode === 'ON') {
-                // Si on n'a pas encore répondu à CE message précis
-                if (lastRespondedMsgId.current !== lastMsg.id) {
-                    lastRespondedMsgId.current = lastMsg.id; // On verrouille immédiatement
-                    setIsLoading(true);
-                    console.log("🤖 [POMDP] Génération Action Optimale...");
-                    
-                    fetch(`${process.env.NEXT_PUBLIC_API_URL}/agent/respond`, {
-                        method: 'POST',
-                        headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify({ session_id: sessionId, message: lastMsg.text })
-                    }).finally(() => setIsLoading(false));
-                }
+            else if (mode === 'ON' && lastRespondedMsgId.current !== lastUserMsg.id) {
+                lastRespondedMsgId.current = lastUserMsg.id;
+                setIsLoading(true);
+                console.log(`🤖 [POMDP] Génération (Fenêtre: ${contextWindow} msgs)...`);
+                chatService.agentRespond(lastUserMsg.text, sessionId, contextWindow).then(res => {
+                    if (res.session_id && !sessionId) updateSessionId(res.session_id);
+                }).catch(console.error).finally(() => setIsLoading(false));
             }
         }
-    }, [messages, mode, role, sessionId]); // Se déclenche quand la liste CHANGER OU le mode CHANGE
+    }, [messages, mode, role, sessionId, contextWindow, updateSessionId]);
 
 
-    // 4. ENVOI MANUEL DE MESSAGE
+    // --- ENVOI MANUEL ---
     const handleSendMessage = async () => {
         if (!inputText.trim()) return;
         const msgToSend = inputText;
         setInputText('');
 
-        // Optimistic UI pour affichage instantané
         const tempId = Date.now();
         setMessages(prev => [...prev, { id: tempId, text: msgToSend, sender: role, time: 'Main' }]);
-
-        // On verrouille manuellement l'IA pour ne pas qu'elle réponde à notre propre message
         lastRespondedMsgId.current = tempId;
 
-        await fetch(`${process.env.NEXT_PUBLIC_API_URL}/message`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ session_id: sessionId, role: role, content: msgToSend })
-        });
+        try {
+            const res = await chatService.sendHumanMessage(msgToSend, role, sessionId);
+            // On récupère le SessionID si c'était le 1er message du chat !
+            if (res.session_id && !sessionId) {
+                updateSessionId(res.session_id);
+            }
+        } catch (e) {
+            console.error("Erreur d'envoi", e);
+        }
     };
 
     return (
         <div className="flex flex-col h-full relative">
             <header className="h-16 bg-white border-b px-4 md:px-6 flex items-center justify-between">
                 <div className="flex items-center gap-3">
-                    {/* Bouton Retour Mobile */}
                     <Link href="/chat" className="md:hidden text-slate-500 hover:bg-slate-100 p-2 rounded-full">
                         <ChevronLeft size={24}/>
                     </Link>
-                    
                     <div className={`w-10 h-10 rounded-full flex items-center justify-center text-white ${role === 'agent' ? 'bg-[#121820]' : 'bg-[#f37321]'}`}>
                         {role === 'agent' ? <Briefcase size={20}/> : <User size={20}/>}
                     </div>
@@ -140,6 +155,11 @@ export default function ChatPage({ params }: { params: { chatId: string } }) {
             </header>
 
             <div className="flex-1 overflow-y-auto p-4 md:p-6 space-y-6 bg-[#f8f9fa]">
+                {messages.length === 0 && (
+                    <div className="flex h-full items-center justify-center text-slate-400 text-sm">
+                        Envoyez un message pour démarrer la session.
+                    </div>
+                )}
                 {messages.map((msg) => {
                     const isMe = msg.sender === role;
                     return (
@@ -167,21 +187,42 @@ export default function ChatPage({ params }: { params: { chatId: string } }) {
             <footer className="p-4 md:p-6 bg-white border-t">
                 <div className="max-w-4xl mx-auto flex flex-col gap-4">
                     
-                    {/* PANNEAU IA (Visible uniquement par l'Agent) - Scrollable sur mobile si besoin */}
+                    {/* PANNEAU IA (Visible uniquement par l'Agent) */}
                     {role === 'agent' && (
-                        <div className="flex overflow-x-auto bg-slate-100 rounded-xl p-1 shadow-inner border border-slate-200 w-full md:w-fit items-center gap-1">
-                            <button onClick={() => setMode('OFF')}
-                                className={`flex-1 md:flex-none px-4 py-2 md:py-1.5 rounded-lg text-[11px] font-bold transition-all flex justify-center items-center gap-2 ${mode === 'OFF' ? 'bg-white text-slate-800 shadow' : 'text-slate-400 hover:text-slate-600'}`}>
-                                <EyeOff size={14} /> OFF
-                            </button>
-                            <button onClick={() => setMode('LISTEN')}
-                                className={`flex-1 md:flex-none px-4 py-2 md:py-1.5 rounded-lg text-[11px] font-bold transition-all flex justify-center items-center gap-2 ${mode === 'LISTEN' ? 'bg-blue-500 text-white shadow' : 'text-slate-400 hover:text-slate-600'}`}>
-                                <BrainCircuit size={14} /> LISTEN
-                            </button>
-                            <button onClick={() => setMode('ON')}
-                                className={`flex-1 md:flex-none px-4 py-2 md:py-1.5 rounded-lg text-[11px] font-bold transition-all flex justify-center items-center gap-2 ${mode === 'ON' ? 'bg-[#f37321] text-white shadow' : 'text-slate-400 hover:text-slate-600'}`}>
-                                <Bot size={14} /> AUTO
-                            </button>
+                        <div className="flex flex-col gap-2">
+                            <div className="flex overflow-x-auto bg-slate-100 rounded-xl p-1 shadow-inner border border-slate-200 w-full md:w-fit items-center gap-1">
+                                <button onClick={() => setMode('OFF')}
+                                    className={`flex-1 md:flex-none px-4 py-2 md:py-1.5 rounded-lg text-[11px] font-bold transition-all flex justify-center items-center gap-2 ${mode === 'OFF' ? 'bg-white text-slate-800 shadow' : 'text-slate-400 hover:text-slate-600'}`}>
+                                    <EyeOff size={14} /> OFF
+                                </button>
+                                <button onClick={() => setMode('LISTEN')}
+                                    className={`flex-1 md:flex-none px-4 py-2 md:py-1.5 rounded-lg text-[11px] font-bold transition-all flex justify-center items-center gap-2 ${mode === 'LISTEN' ? 'bg-blue-500 text-white shadow' : 'text-slate-400 hover:text-slate-600'}`}>
+                                    <BrainCircuit size={14} /> LISTEN
+                                </button>
+                                <button onClick={() => setMode('ON')}
+                                    className={`flex-1 md:flex-none px-4 py-2 md:py-1.5 rounded-lg text-[11px] font-bold transition-all flex justify-center items-center gap-2 ${mode === 'ON' ? 'bg-[#f37321] text-white shadow' : 'text-slate-400 hover:text-slate-600'}`}>
+                                    <Bot size={14} /> AUTO
+                                </button>
+                                
+                                <button onClick={() => setShowSettings(!showSettings)} 
+                                    className="px-3 py-1.5 text-slate-400 hover:text-slate-700 ml-auto border-l border-slate-300">
+                                    <Settings2 size={16} />
+                                </button>
+                            </div>
+
+                            {/* Options avancées : Fenêtre de Contexte */}
+                            {showSettings && (
+                                <div className="bg-slate-50 border border-slate-200 p-3 rounded-lg flex items-center gap-4 text-xs animate-in fade-in slide-in-from-top-2">
+                                    <span className="font-bold text-slate-600">Fenêtre de contexte (Historique lu par l'IA) :</span>
+                                    <input 
+                                        type="range" min="2" max="20" step="2"
+                                        value={contextWindow} 
+                                        onChange={(e) => setContextWindow(Number(e.target.value))}
+                                        className="w-32 accent-[#f37321]"
+                                    />
+                                    <span className="font-mono bg-white px-2 py-1 rounded border border-slate-200">{contextWindow} msgs</span>
+                                </div>
+                            )}
                         </div>
                     )}
 
