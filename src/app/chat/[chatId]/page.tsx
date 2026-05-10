@@ -71,14 +71,7 @@ export default function ChatPage({ params }: { params: Promise<{ chatId: string 
                     time: new Date().toLocaleTimeString([], {hour: '2-digit', minute:'2-digit'})
                 }));
                 
-                // On ne met à jour que si on a de nouveaux messages du serveur
-                // Cela évite de supprimer le message local optimiste avant qu'il ne soit persisté
-                setMessages(prev => {
-                    if (mapped.length > prev.filter(m => String(m.id).startsWith('hist-')).length) {
-                        return mapped;
-                    }
-                    return prev;
-                });
+                setMessages(mapped);
                 
                 // Si c'est le premier chargement complet
                 if (processedCount.current === 0 && mapped.length > 0) {

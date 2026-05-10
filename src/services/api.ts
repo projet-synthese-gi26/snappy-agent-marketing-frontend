@@ -11,8 +11,7 @@ export const chatService = {
     },
 
     async sendHumanMessage(content: string, role: string, sessionId: string | null) {
-        // const res = await fetch(`${API_BASE}/message`, {
-        const res = await fetch(`${API_BASE}/agent/simulate-human`, {
+        const res = await fetch(`${API_BASE}/message`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ session_id: sessionId, role, content })
